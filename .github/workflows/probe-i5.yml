@@ -1,0 +1,93 @@
+name: Sonda i5 (heartbeat esterno)
+
+# Vive in un repo PUBBLICO dedicato: sui repo pubblici le Actions non
+# consumano i 2000 min/mese del piano (in mp-platform, privato, una sonda
+# ogni 5 min avrebbe bruciato la quota in una settimana bloccando anche le
+# build APK — presa di Francesco, 17/07).
+#
+# Controlla dall'esterno gli endpoint pubblici serviti dall'i5 via tunnel
+# Cloudflare: se i5/tunnel/app cadono, Cloudflare risponde 5xx/timeout.
+# 2xx/3xx/401/403 = catena viva (302 = redirect CF Access/login: ok).
+# Avvisa via ntfy SOLO sulle transizioni (giu' / ripreso), niente spam.
+# Il topic ntfy sta nel secret NTFY_TOPIC (repo pubblico: niente in chiaro).
+#
+# Keep-alive: GitHub disabilita gli schedule nei repo fermi da 60 giorni ->
+# se l'ultimo commit ha piu' di 50 giorni, il job pusha un commit vuoto.
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: probe-i5
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: write   # solo per il commit vuoto di keep-alive
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Controlla endpoint e avvisa sulle transizioni
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          set -u
+          URLS="https://app.mp-platform.com/login https://cam.mp-platform.com/"
+
+          fails=""
+          for url in $URLS; do
+            ok=0
+            for i in 1 2 3; do   # 3 tentativi distanziati: niente falsi allarmi da hiccup
+              code=$(curl -s -o /dev/null -m 20 -w '%{http_code}' "$url" || echo 000)
+              case "$code" in 2*|3*|401|403) ok=1; break ;; esac
+              sleep 20
+            done
+            [ "$ok" -eq 1 ] || fails="$fails $url (HTTP $code)"
+          done
+
+          prev=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/probe-i5.yml/runs?status=completed&per_page=1" \
+                 --jq '.workflow_runs[0].conclusion' 2>/dev/null || echo unknown)
+
+          notify() { # $1=titolo $2=messaggio $3=priorita $4=tags
+            curl -s -m 15 \
+              -H "Title: $1" -H "Priority: $3" -H "Tags: $4" \
+              -d "$2" "https://ntfy.sh/${NTFY_TOPIC}" >/dev/null || true
+          }
+
+          if [ -n "$fails" ]; then
+            echo "GIU:$fails (run precedente: $prev)"
+            if [ "$prev" != "failure" ]; then
+              notify "MPS: i5 NON RISPONDE" \
+                "La casa potrebbe essere senza antifurto. Endpoint giu':$fails — controllare corrente/i5/tunnel." \
+                urgent rotating_light
+            fi
+            exit 1
+          fi
+
+          echo "OK (run precedente: $prev)"
+          if [ "$prev" = "failure" ]; then
+            notify "MPS: i5 di nuovo raggiungibile" \
+              "Gli endpoint rispondono di nuovo. Verificare lo stato dell'allarme al rientro del sistema." \
+              default white_check_mark
+          fi
+
+      - name: Keep-alive (evita lo stop degli schedule a 60 giorni)
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          last=$(gh api "repos/${GITHUB_REPOSITORY}/commits?per_page=1" --jq '.[0].commit.committer.date')
+          age=$(( ( $(date +%s) - $(date -d "$last" +%s) ) / 86400 ))
+          echo "ultimo commit: $last (${age}g fa)"
+          if [ "$age" -ge 50 ]; then
+            git clone -q "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" ka
+            cd ka
+            git config user.name "keepalive"; git config user.email "keepalive@mps.local"
+            git commit --allow-empty -q -m "keepalive: mantieni attivi gli schedule"
+            git push -q
+          fi
