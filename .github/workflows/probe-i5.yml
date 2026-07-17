@@ -30,8 +30,13 @@ permissions:
 jobs:
   probe:
     runs-on: ubuntu-latest
+    env:
+      # Email di fallback: attiva da sola quando i secret Gmail sono impostati
+      # (GMAIL_USER, GMAIL_APP_PASSWORD, ADMIN_EMAIL). Senza, resta solo ntfy.
+      HAVE_MAIL: ${{ secrets.GMAIL_USER != '' }}
     steps:
       - name: Controlla endpoint e avvisa sulle transizioni
+        id: probe
         env:
           GH_TOKEN: ${{ github.token }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
@@ -65,7 +70,11 @@ jobs:
               notify "MPS: i5 NON RISPONDE" \
                 "La casa potrebbe essere senza antifurto. Endpoint giu':$fails — controllare corrente/i5/tunnel." \
                 urgent rotating_light
+              echo "alert=down" >> "$GITHUB_OUTPUT"
+            else
+              echo "alert=none" >> "$GITHUB_OUTPUT"
             fi
+            echo "dettaglio=$fails" >> "$GITHUB_OUTPUT"
             exit 1
           fi
 
@@ -74,7 +83,38 @@ jobs:
             notify "MPS: i5 di nuovo raggiungibile" \
               "Gli endpoint rispondono di nuovo. Verificare lo stato dell'allarme al rientro del sistema." \
               default white_check_mark
+            echo "alert=up" >> "$GITHUB_OUTPUT"
+          else
+            echo "alert=none" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Email fallback — i5 giu' (solo transizione)
+        if: always() && steps.probe.outputs.alert == 'down' && env.HAVE_MAIL == 'true'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.GMAIL_USER }}
+          password: ${{ secrets.GMAIL_APP_PASSWORD }}
+          from: MPS Sonda
+          to: ${{ secrets.ADMIN_EMAIL }}
+          subject: "🚨 MPS: i5 NON RISPONDE"
+          body: "La casa potrebbe essere senza antifurto. Endpoint giu': ${{ steps.probe.outputs.dettaglio }} — controllare corrente/i5/tunnel. (Sonda esterna GitHub)"
+
+      - name: Email fallback — i5 ripreso
+        if: always() && steps.probe.outputs.alert == 'up' && env.HAVE_MAIL == 'true'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.GMAIL_USER }}
+          password: ${{ secrets.GMAIL_APP_PASSWORD }}
+          from: MPS Sonda
+          to: ${{ secrets.ADMIN_EMAIL }}
+          subject: "✅ MPS: i5 di nuovo raggiungibile"
+          body: "Gli endpoint rispondono di nuovo. Verificare lo stato dell'allarme al rientro del sistema."
 
       - name: Keep-alive (evita lo stop degli schedule a 60 giorni)
         if: success()
