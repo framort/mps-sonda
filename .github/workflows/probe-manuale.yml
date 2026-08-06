@@ -1,0 +1,43 @@
+name: Sonda manuale (verifica una tantum)
+
+# Copia usa-e-getta della sonda i5, SOLO sul branch di lavoro: stesso controllo
+# endpoint del probe schedulato, ma senza ntfy/email/keepalive e senza leggere
+# lo storico dei run (niente effetti sulla logica delle transizioni di
+# probe-i5.yml). Serve a verificare subito la catena i5/tunnel quando un run
+# schedulato fallisce per cause GitHub (es. #298: job cancellato in coda,
+# mai eseguito). Si puo' cancellare insieme al branch.
+
+on:
+  push:
+    branches: [claude/probe-error-positions-6ussow]
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Controlla endpoint (stessa logica della sonda schedulata)
+        run: |
+          set -u
+          URLS="https://app.mp-platform.com/login https://cam.mp-platform.com/"
+
+          fails=""
+          for url in $URLS; do
+            ok=0
+            for i in 1 2 3; do
+              code=$(curl -s -o /dev/null -m 20 -w '%{http_code}' "$url" || echo 000)
+              echo "$url tentativo $i -> HTTP $code"
+              case "$code" in 2*|3*|401|403) ok=1; break ;; esac
+              sleep 20
+            done
+            [ "$ok" -eq 1 ] || fails="$fails $url (HTTP $code)"
+          done
+
+          if [ -n "$fails" ]; then
+            echo "GIU:$fails"
+            exit 1
+          fi
+          echo "OK: tutti gli endpoint rispondono"
