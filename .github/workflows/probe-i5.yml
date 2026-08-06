@@ -55,8 +55,20 @@ jobs:
             [ "$ok" -eq 1 ] || fails="$fails $url (HTTP $code)"
           done
 
-          prev=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/probe-i5.yml/runs?status=completed&per_page=1" \
-                 --jq '.workflow_runs[0].conclusion' 2>/dev/null || echo unknown)
+          # Stato del run precedente per la logica delle transizioni. NON basta la
+          # conclusion del RUN: un job cancellato in coda da GitHub (mai eseguito,
+          # runner_id=0 -- successo coi run #298/#299 del 06/08) marca comunque il
+          # run come "failure", e al run verde successivo partirebbe un falso
+          # "i5 di nuovo raggiungibile". Si guarda quindi la conclusion del JOB:
+          # solo success/failure sono esiti reali della sonda; cancelled/skipped
+          # = run mai eseguito, si salta e si guarda il run prima.
+          prev=unknown
+          for rid in $(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/probe-i5.yml/runs?status=completed&per_page=5" \
+                       --jq '.workflow_runs[].id' 2>/dev/null); do
+            jc=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${rid}/jobs" \
+                 --jq '.jobs[0].conclusion' 2>/dev/null || echo "")
+            case "$jc" in success|failure) prev="$jc"; break ;; esac
+          done
 
           notify() { # $1=titolo $2=messaggio $3=priorita $4=tags
             curl -s -m 15 \
