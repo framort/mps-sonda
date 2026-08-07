@@ -13,6 +13,13 @@ name: Sonda i5 (heartbeat esterno)
 #
 # Keep-alive: GitHub disabilita gli schedule nei repo fermi da 60 giorni ->
 # se l'ultimo commit ha piu' di 50 giorni, il job pusha un commit vuoto.
+#
+# Repo pubblico: OK per ora (presa di Francesco, 07/08) -- niente segreti ne'
+# accessi verso casa nel repo, quindi non e' una porta d'ingresso. Il limite
+# noto e' informativo: run e log sono visibili a chiunque, quindi la storia
+# verde/rosso e' di fatto un monitor pubblico dell'uptime dell'antifurto.
+# Evoluzione prevista quando si vorra' blindare: servizio esterno privato
+# (healthchecks.io / UptimeRobot) o repo privato accettando i limiti di quota.
 
 on:
   schedule:
