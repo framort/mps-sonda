@@ -11,8 +11,22 @@ name: Sonda i5 (heartbeat esterno)
 # Avvisa via ntfy SOLO sulle transizioni (giu' / ripreso), niente spam.
 # Il topic ntfy sta nel secret NTFY_TOPIC (repo pubblico: niente in chiaro).
 #
+# LIMITE NOTO (issue #3): Cloudflare Access risponde 302 dal proprio edge
+# SENZA contattare l'i5, anche a casa senza corrente (prova: blackout
+# 12/08, run #446 ha stampato OK a 47s dal blackout). Questo controllo
+# quindi NON puo' vedere un guasto totale (i5/corrente/tunnel tutti giu'):
+# per quello c'e' heartbeat-check.yml (dead-man's switch), che non dipende
+# da cosa risponde Cloudflare. Questo workflow resta utile per i guasti che
+# heartbeat-check.yml non vede: tunnel Cloudflare rotto con i5 acceso e
+# corrente regolare da' qui un 5xx/timeout reale. I due sono complementari,
+# non ridondanti — vedi README.md.
+#
 # Keep-alive: GitHub disabilita gli schedule nei repo fermi da 60 giorni ->
 # se l'ultimo commit ha piu' di 50 giorni, il job pusha un commit vuoto.
+# (Questo e' anche il keep-alive per l'intero repo, incluso
+# heartbeat-check.yml: se in futuro questo workflow viene disattivato, va
+# spostato anche qui, altrimenti dopo 60 giorni di silenzio GitHub
+# disabilita gli schedule di ENTRAMBI i workflow.)
 
 on:
   schedule:

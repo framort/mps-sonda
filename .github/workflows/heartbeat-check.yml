@@ -1,0 +1,142 @@
+name: Sonda i5 (dead-man's switch)
+
+# Issue #3: probe-i5.yml chiede "sei vivo?" a app/cam.mp-platform.com, ma
+# quei domini stanno dietro Cloudflare Access, che risponde 302 dal proprio
+# edge SENZA mai contattare l'i5. Il 12/08, con la casa senza corrente da
+# 47 secondi, quel controllo ha stampato OK. Non e' un bug piccolo: e'
+# strutturalmente cieco, non puo' fisicamente vedere un guasto totale.
+#
+# Questo workflow non chiede piu' "sei vivo?" a chi risponde sempre di si'.
+# Aspetta invece un segnale che solo l'i5 puo' produrre: un heartbeat che
+# l'i5 pubblica su ntfy.sh ogni ~10 minuti (script in i5/heartbeat-publish.sh,
+# NON installato da questo commit: lo installa Francesco quando autorizza).
+# L'heartbeat esce direttamente verso ntfy.sh, senza passare dal tunnel
+# Cloudflare ne' dai domini app/cam: prova che l'i5 ha corrente e rete, non
+# che il tunnel funzioni (quello lo controlla ancora probe-i5.yml, che
+# resta attivo — i due workflow coprono guasti diversi, vedi README.md).
+#
+# Nessun nuovo secret: il topic heartbeat e' <NTFY_TOPIC>-heartbeat,
+# derivato dallo stesso secret NTFY_TOPIC gia' in uso da probe-i5.yml.
+#
+# SOGLIA E FINESTRA CIECA REALE (da non minimizzare):
+# Il cron di GitHub NON viene onorato agli intervalli nominali: sull'altro
+# workflow di questo repo (*/5 nominale) gli intervalli reali misurati sono
+# stati 40-155 minuti. Non c'e' motivo di aspettarsi che questo workflow si
+# comporti meglio solo perche' il cron nominale e' piu' largo: il ritardo
+# osservato viene dalla coda di GitHub per gli schedule sui repo pubblici,
+# non dal valore del cron. Per questo la soglia sotto e' di ore, non di
+# minuti, e va lasciata larga apposta: se fosse vicina al ritardo massimo
+# osservato (155 min), il solo ritardo di GitHub — senza NESSUN guasto reale
+# — genererebbe falsi allarmi a raffica ogni volta che uno schedule slitta.
+#
+# Con SOGLIA_MINUTI=240 (4 ore) e un ritardo di schedulazione fino a ~155
+# minuti come gia' osservato, la finestra cieca nel caso peggiore e' di
+# CIRCA 6-7 ORE, non di 5 minuti e non di 4 ore. Nella pratica sara' quasi
+# sempre piu' veloce (i ritardi di 150+ minuti sono la coda della
+# distribuzione, non la norma), ma questa sonda resta un rilevatore "ce ne
+# accorgiamo entro qualche ora", non un allarme in tempo reale — quello lo
+# fa il sistema antifurto vero.
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      simula_heartbeat_mancante:
+        description: "Collaudo: forza il ramo 'heartbeat mancante' e manda un alert reale marcato [COLLAUDO]"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: heartbeat-check
+  cancel-in-progress: false
+
+permissions:
+  actions: read   # solo per leggere l'esito del run precedente (transizioni)
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verifica ultimo heartbeat e avvisa sulle transizioni
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          SIMULA: ${{ github.event.inputs.simula_heartbeat_mancante || 'false' }}
+        run: |
+          set -u
+          SOGLIA_MINUTI=240   # 4 ore — motivazione nel commento in testa al file
+          HEARTBEAT_TOPIC="${NTFY_TOPIC}-heartbeat"
+
+          if [ "$SIMULA" = "true" ]; then
+            echo "COLLAUDO: input manuale, forzo il ramo 'heartbeat mancante' senza interrogare ntfy."
+            eta_min=999999
+            mai_visto=1
+          else
+            risposta=$(curl -s -m 20 "https://ntfy.sh/${HEARTBEAT_TOPIC}/json?poll=1&since=12h" || echo "")
+            ultimo_epoch=$(printf '%s\n' "$risposta" | tail -n 1 | jq -r '.time // empty' 2>/dev/null || echo "")
+            if [ -z "$ultimo_epoch" ]; then
+              echo "Nessun heartbeat nella cache ntfy (finestra 12h): mai installato sull'i5, oppure fermo da piu' di 12h."
+              eta_min=999999
+              mai_visto=1
+            else
+              ora=$(date +%s)
+              eta_min=$(( (ora - ultimo_epoch) / 60 ))
+              mai_visto=0
+              echo "Ultimo heartbeat: ${eta_min} minuti fa (soglia ${SOGLIA_MINUTI})."
+            fi
+          fi
+
+          # Stato del run precedente per la logica delle transizioni. Stesso
+          # motivo di probe-i5.yml (#2): si guarda la conclusion del JOB, non
+          # quella del RUN, perche' un run cancellato in coda da GitHub marca
+          # comunque il run come "failure" senza che la sonda abbia girato.
+          prev=unknown
+          for rid in $(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/heartbeat-check.yml/runs?status=completed&per_page=5" \
+                       --jq '.workflow_runs[].id' 2>/dev/null); do
+            jc=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${rid}/jobs" \
+                 --jq '.jobs[0].conclusion' 2>/dev/null || echo "")
+            case "$jc" in success|failure) prev="$jc"; break ;; esac
+          done
+
+          notify() { # $1=titolo $2=messaggio $3=priorita $4=tags
+            curl -s -m 15 \
+              -H "Title: $1" -H "Priority: $3" -H "Tags: $4" \
+              -d "$2" "https://ntfy.sh/${NTFY_TOPIC}" >/dev/null || true
+          }
+
+          prefisso=""
+          [ "$SIMULA" = "true" ] && prefisso="[COLLAUDO] "
+
+          if [ "$eta_min" -gt "$SOGLIA_MINUTI" ]; then
+            echo "ALLARME: heartbeat mancante da oltre la soglia (run precedente: $prev)."
+            if [ "$prev" != "failure" ]; then
+              if [ "$mai_visto" -eq 1 ] && [ "$SIMULA" != "true" ]; then
+                msg="Nessun heartbeat dall'i5 da almeno 12h (o mai installato). Se e' la prima volta dopo l'installazione, controllare lo script su i5; altrimenti la casa potrebbe essere senza corrente/rete."
+              else
+                msg="Nessun heartbeat dall'i5 da oltre ${SOGLIA_MINUTI} minuti. La casa potrebbe essere senza corrente/rete — controllare (dead-man's switch, issue #3)."
+              fi
+              notify "${prefisso}MPS: heartbeat i5 assente" "$msg" urgent rotating_light
+              echo "alert=down" >> "$GITHUB_OUTPUT"
+            else
+              echo "alert=none" >> "$GITHUB_OUTPUT"
+            fi
+            # Il run DEVE risultare rosso anche in collaudo: e' proprio quello
+            # che si sta verificando ("deve poter diventare rossa a comando").
+            # Il run successivo (schedulato o manuale con simula=false) vedra'
+            # prev=failure e, se l'heartbeat reale e' a posto, mandera' anche
+            # l'alert di ripristino: un solo collaudo esercita entrambi i rami.
+            exit 1
+          fi
+
+          echo "OK: heartbeat recente (run precedente: $prev)."
+          if [ "$prev" = "failure" ]; then
+            notify "MPS: heartbeat i5 ripreso" \
+              "L'i5 torna a pubblicare heartbeat regolari. Verificare comunque lo stato dell'antifurto al rientro del sistema." \
+              default white_check_mark
+            echo "alert=up" >> "$GITHUB_OUTPUT"
+          else
+            echo "alert=none" >> "$GITHUB_OUTPUT"
+          fi
